@@ -1,0 +1,494 @@
+---
+title: "Senior Project V2"
+author: "Devon Lapierre"
+date: "2026-05-31"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#Loading Dataset
+setwd("C:/Users/devon/OneDrive/Senior Project")
+
+mlb <- read.csv("stats.csv", header = TRUE, sep = ",")
+head(mlb)
+```
+
+
+```{r}
+#Basic Cleaning
+
+mlb <- na.omit(mlb)
+mlb <- mlb[!duplicated(mlb), ]
+
+summary(mlb)
+#The dataset is almost perfectly clean, since the data on BaseballSavant is ensured to be up to date, accurate, and complete
+```
+
+```{r}
+# Creating formula for wRAA to measure player performance
+
+# scale vector (first index 2015, last index 2025) from FanGraphs: https://www.fangraphs.com/tools/guts?type=cn
+wOBA_scale <- c(1.251, 1.212, 1.185, 1.226, 1.157, 1.185, 1.209, 1.259, 1.204, 1.242, 1.232)
+
+# league average wOBA by season (first index 2015, last index 2025) from FanGraphs: https://www.fangraphs.com/leaders/major-league?pos=all&stats=bat&lg=all&qual=0&type=8&month=0&ind=0&team=0%2Css&rost=0&players=0&sort=0%2Cd&startdate=&enddate=&season1=2015&season=2025
+lgwOBA <- c(.313, .318, .321, .315, .320, .320, .314, .310, .318, .310, .313)
+```
+
+```{r}
+# Using the FanGraphs formula Weighted Runs Above Average (wRAA) = ((wOBA - lgwOBA) / wOBA_scale) * PA to have a metric strictly for offensive performance
+
+mlb$wRAA <- 0
+
+#test formula on first observation
+#mlb$wRAA[1]<- ((mlb$woba[1] - lgwOBA[mlb$year[1] - 2014]) / wOBA_scale[mlb$year[1] - 2014]) * mlb$pa[1]
+
+
+#apply formula to all observations
+for (i in 1:nrow(mlb)){
+  mlb$wRAA[i]<- ((mlb$woba[i] - lgwOBA[mlb$year[i] - 2014]) / wOBA_scale[mlb$year[i] - 2014]) * mlb$pa[i]
+}
+
+summary(mlb$wRAA)
+```
+
+```{r}
+#Data Validation
+hist(mlb$batting_avg)
+hist(mlb$player_age)
+hist(mlb$slg_percent)
+hist(mlb$on_base_percent)
+```
+
+```{r}
+#Exploratory subset selection for wRAA
+
+library(leaps)
+
+#filter out the variables that are not features as well as the variables that are used to calculate wRAA
+best_sub <- regsubsets(wRAA~player_age+hit+double+triple+home_run+strikeout+walk+batting_avg+on_base_plus_slg+isolated_power+b_rbi+b_lob+r_total_stolen_base+r_run+exit_velocity_avg+launch_angle_avg+sweet_spot_percent, data = mlb, nvmax = 8)
+
+summary(best_sub)
+```
+Best subset shows the most significant predictors out of the metrics chosen (educated choices) to be On Base + Slugging, walks, Left on Base, runs scored in order.
+
+```{r}
+#Checking the models from best subset selection
+
+wRAA_1 <- lm(wRAA~on_base_plus_slg, data = mlb)
+summary(wRAA_1)
+```
+
+```{r}
+wRAA_2 <- lm(wRAA~on_base_plus_slg+walk, data = mlb)
+summary(wRAA_2)
+```
+
+```{r}
+wRAA_3 <- lm(wRAA~on_base_plus_slg+b_lob+r_run, data = mlb)
+summary(wRAA_3)
+```
+
+```{r}
+# swing decision feature column indices
+swing_cols <- c(49, 50, 51, 52, 53, 56, 58, 59, 64, 67, 69, 71, 72, 73, 74, 75, 77, 78, 80, 82, 84)
+
+for (i in swing_cols){
+  mlb[ , i] <- mlb[ , i] / 100
+}
+
+swing_cols <- c(13, 17, 20, 28, 86, 49, 50, 51, 52, 53, 56, 58, 59, 64, 67, 69, 71, 72, 73, 74, 75, 77, 78, 80, 82, 84)
+
+#subset of features only including swing decision features and potential response variables
+mlb_swings <- mlb[, swing_cols]
+
+
+#Histograms for all the variables in swing subset
+for (v in names(mlb_swings)) {
+  hist(mlb_swings[[v]], main = paste("Histogram of", v),
+       xlab = v, col = "lightgray", border = "white")
+}
+
+```
+
+```{r}
+#Skew detection for the variables
+skew <- function(x) {
+  m <- mean(x, na.rm = TRUE)
+  s <- sd(x, na.rm = TRUE)
+  mean(((x - m) / s)^3, na.rm = TRUE)
+}
+
+sapply(mlb_swings, skew)
+
+```
+
+
+Most of the variables pass the skew check. The ones that definitely need to be transformed are walks and wRAA, and runs will be inspected as well.
+```{r}
+mlb_swings$walk_percent <- mlb$walk / mlb$pa
+
+hist(mlb_swings$walk_percent)
+
+skew(mlb_swings$walk_percent)
+```
+Changing walks to walk percent helped bring the skew down almost enough.
+
+```{r}
+mlb_swings$run_percent <- mlb$r_run / mlb$pa
+
+hist(mlb_swings$run_percent)
+
+skew(mlb_swings$run_percent)
+```
+Changing runs to run percent eliminated the skew from the original variable
+
+Still need to figure out wRAA.
+
+
+```{r}
+#Correlation Matrix
+
+#taking out original walks and runs variables for obvious correlation reasons
+mlb_swings <- mlb_swings[ , c(-1, -4)]
+
+cor(mlb_swings, use = "pairwise.complete.obs")
+
+```
+
+Skimming through the correlation matrix all heavy correlations make sense based on prior knowledge of the variables.
+
+
+```{r}
+#Collinearity
+
+vif <- function(model) {
+  X <- model.matrix(model)[, -1]  # drop intercept
+  vifs <- numeric(ncol(X))
+  names(vifs) <- colnames(X)
+
+  for (i in seq_along(vifs)) {
+    xi <- X[, i]
+    others <- X[, -i, drop = FALSE]
+    r2 <- summary(lm(xi ~ others))$r.squared
+    vifs[i] <- 1 / (1 - r2)
+  }
+  vifs
+}
+
+model <- lm(wRAA ~ ., data = mlb_swings)
+vif(model)
+
+```
+
+Variables with acceptable collinearity: OPS, LOB, meatball sw %, meatball %, edge %, strike %, walk %, run %
+
+PCA is needed to adjust other predictors..
+
+```{r}
+# Principal Component Analysis 
+swings_scaled <- scale(mlb_swings)
+pca <- prcomp(swings_scaled)
+summary(pca)
+plot(pca)
+
+```
+
+
+First 10-12 PCs explain about 85-91% of the variable structure
+
+No sharp elbow in the spree means gradual decay
+```{r}
+pca$rotation
+```
+PC1-5 Interpretation:
+
+PC1: Swing and Miss - High PC1 score -> heavy swing and miss, low PC1 score -> heavy contact hitter
+PC2: Plate Discipline - High PC2 -> patient, selective hitters, low PC2 -> aggressive free swingers
+PC3: Direction and Launch - High PC3 -> heavy fly balls/popups, low PC3 -> linedrive, groundball pull hitters
+PC4: Direction: High PC4 -> pull, low PC4 -> oppo
+PC5: Zone Exploitation: High PC5 -> less conversion on more hittable pitches, low PC5 -> produces on hittable pitches
+
+If neural network modeling or ridge/lasso regression end up being performed in this project, these principle components could be used to improve performance.
+
+
+```{r}
+#Baseline Model - Linear Regression
+
+
+#Creating the 80/20 train/test split
+set.seed(1)
+n <- nrow(mlb_swings)
+train_idx <- sample(seq_len(n), size = 0.8 * n)
+
+train <- mlb_swings[train_idx, ]
+test  <- mlb_swings[-train_idx, ]
+
+```
+
+
+```{r}
+#Will use best subset to investigate the most significant variables
+
+wRAA_sub <- regsubsets(wRAA~.-on_base_plus_slg-b_lob-walk_percent-run_percent, data = mlb_swings, nvmax = 8)
+summary(wRAA_sub)
+```
+Best 1 predictor model: in zone %
+Best 2 predictor: in zone % + out of zone sw %
+Best 3 predictor: in zone % + out of zone sw % + line drive %
+Best 4 predictor: in zone % + out of zone sw % + ground ball % + popup %
+Best 5 predictor: in zone % + out of zone sw % + ground ball % + popup % + out of zone sw/miss %
+
+Will start with these models and check performance
+
+```{r}
+wRAA_sw_m1 <- lm(wRAA~in_zone_percent, data = train)
+summary(wRAA_sw_m1)
+```
+
+```{r}
+wRAA_sw_m2 <- lm(wRAA~in_zone_percent+oz_swing_percent, data = train)
+summary(wRAA_sw_m2)
+```
+The swing metrics definitely don't seem to be great predictors of wRAA just based off of the R^2 values of the first few models. This was somewhat expected, which is why we first modeled basic offensive statistics that predit wRAA to begin with. The most significant predictor of wRAA was OPS, so we will restart with that as the response variable.
+
+
+```{r}
+ops_best_sub <- regsubsets(on_base_plus_slg~.-wRAA-b_lob-walk_percent-run_percent, data = mlb_swings, nvmax = 8)
+summary(ops_best_sub)
+```
+Best 1 predictor model: in zone %
+Best 2 predictor: in zone % + line drive %
+Best 3 predictor: in zone % + line drive % + out of zone swing %
+Best 4 predictor: in zone % + line drive % + out of zone swing % + fly ball %
+Best 5 predictor: in zone % + out of zone swing % + out of zone swing/miss % + ground ball % + pop up %
+
+
+```{r}
+ops_mod1 <- lm(on_base_plus_slg~in_zone_percent, data = train)
+summary(ops_mod1)
+```
+
+```{r}
+ops_mod2 <- lm(on_base_plus_slg~in_zone_percent+linedrives_percent, data = train)
+summary(ops_mod2)
+```
+```{r}
+ops_mod3 <- lm(on_base_plus_slg~in_zone_percent+linedrives_percent+oz_swing_percent, data = train)
+summary(ops_mod3)
+```
+
+```{r}
+ops_mod4 <- lm(on_base_plus_slg~in_zone_percent+linedrives_percent+oz_swing_percent+flyballs_percent, data = train)
+summary(ops_mod4)
+```
+
+
+
+```{r}
+pc_scores <- pca$x[ , 1:5]
+
+pc_model <- lm(mlb$on_base_plus_slg~., data = as.data.frame(pc_scores))
+
+summary(pc_model)
+```
+
+```{r}
+hist(pc_model$residuals)
+```
+
+
+```{r}
+# Standardize helper
+z <- function(x) (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+
+# 1. Contact Skill (PC1-like)
+mlb_swings$ContactSkill <- (
+    z(mlb_swings$iz_contact_percent) +
+    z(mlb_swings$oz_contact_percent) -
+    z(mlb_swings$whiff_percent) -
+    z(mlb_swings$z_swing_miss_percent) -
+    z(mlb_swings$oz_swing_miss_percent)
+) / 5
+
+# 2. Discipline Index (PC2-like)
+mlb_swings$DisciplineIndex <- (
+    -z(mlb_swings$oz_swing_percent) -
+    -z(mlb_swings$z_swing_percent) -
+    z(mlb_swings$out_zone_percent) +
+    z(mlb_swings$walk_percent)
+) / 4
+
+# 3. Elevation / Batted-Ball Shape (PC3-like)
+mlb_swings$ElevationIndex <- (
+    z(mlb_swings$popups_percent) +
+    z(mlb_swings$walk_percent) -
+    z(mlb_swings$pull_percent)
+) / 3
+
+# 4. Zone Coverage (PC4-like)
+mlb_swings$ZoneCoverage <- (
+    z(mlb_swings$in_zone_percent) +
+    z(mlb_swings$out_zone_percent) -
+    z(mlb_swings$meatball_percent)
+) / 3
+
+# 5. Spray Power (PC5-like)
+mlb_swings$SprayPower <- (
+    z(mlb_swings$opposite_percent) -
+    z(mlb_swings$pull_percent) +
+    z(mlb_swings$on_base_plus_slg)
+) / 3
+
+```
+
+
+
+```{r}
+
+retrain <- mlb_swings[train_idx, ]
+retest  <- mlb_swings[-train_idx, ]
+
+# further sub-dataset with engineered features and response, more features could be added
+
+sw_feats <- c(3, 27, 28, 29, 30, 31)
+
+sw_dat <- mlb_swings[, sw_feats]
+```
+
+
+```{r}
+# with a small set of features for modeling, Linear Regression in forward stepwise fashion will be performed manually
+
+trainEng <- sw_dat[train_idx, ]
+testEng  <- sw_dat[-train_idx, ]
+
+contact_mod <- lm(wRAA~ContactSkill, data = trainEng)
+discip_mod <- lm(wRAA~DisciplineIndex, data = trainEng)
+elev_mod <- lm(wRAA~ElevationIndex, data = trainEng)
+zone_mod <- lm(wRAA~ZoneCoverage, data = trainEng)
+spray_mod <- lm(wRAA~SprayPower, data = trainEng)
+
+summary(contact_mod)
+summary(discip_mod)
+summary(elev_mod)
+summary(zone_mod)
+summary(spray_mod)
+```
+
+
+
+```{r}
+spray_mod1 <- lm(wRAA~SprayPower+ContactSkill, data = trainEng)
+spray_mod2 <- lm(wRAA~SprayPower+DisciplineIndex, data = trainEng)
+spray_mod3 <- lm(wRAA~SprayPower+ElevationIndex, data = trainEng)
+spray_mod4 <- lm(wRAA~SprayPower+ZoneCoverage, data = trainEng)
+
+summary(spray_mod1)
+summary(spray_mod2)
+summary(spray_mod3)
+summary(spray_mod4)
+```
+
+```{r}
+sprayZone_mod1 <- lm(wRAA~SprayPower+ZoneCoverage+ContactSkill, data = trainEng)
+sprayZone_mod2 <- lm(wRAA~SprayPower+ZoneCoverage+DisciplineIndex, data = trainEng)
+sprayZone_mod3 <- lm(wRAA~SprayPower+ZoneCoverage+ElevationIndex, data = trainEng)
+
+summary(sprayZone_mod1)
+summary(sprayZone_mod2)
+summary(sprayZone_mod3)
+```
+
+```{r}
+sprayZoneDisc_mod1 <- lm(wRAA~SprayPower+ZoneCoverage+DisciplineIndex+ContactSkill, data = trainEng)
+sprayZoneDisc_mod2 <- lm(wRAA~SprayPower+ZoneCoverage+DisciplineIndex+ElevationIndex, data = trainEng)
+
+summary(sprayZoneDisc_mod1)
+summary(sprayZoneDisc_mod2)
+```
+
+```{r}
+engSwing_mod <- lm(wRAA~SprayPower+ZoneCoverage+DisciplineIndex+ElevationIndex+ContactSkill, data = trainEng)
+summary(engSwing_mod)
+```
+The linear regression models with the engineered features perform well predictively, but do not explain more than 20% of the variability in the data meaning that they don't display much significance outside the training set of data, and there is too much outside noise in the overall dataset to leave predicting up to just these features.
+
+
+```{r}
+#Random Forests
+
+library(tree)
+set.seed(1)
+
+# 1 singular decision tree with the engineered features
+
+engSwng_tree <- tree(wRAA~., data = trainEng)
+
+plot(engSwng_tree)
+text(engSwng_tree, pretty = 10)
+
+```
+
+
+```{r}
+cv_overgrown <- cv.tree(engSwng_tree, FUN = prune.tree)
+plot(cv_overgrown$size, cv_overgrown$dev, type = 'b')
+```
+
+```{r}
+pruned_Swng <- prune.tree(engSwng_tree, best = 4)
+plot(pruned_Swng)
+text(pruned_Swng, pretty = 10)
+```
+
+```{r}
+
+library(randomForest)
+#Will grow two random forests - one with all of the swing decision metrics as predictors, and one with just the engineered features. Potentially a third with a combination of both depending on how the first two perform.
+
+
+# forest with only swing metrics
+rf_allSwng <- randomForest(wRAA~.-on_base_plus_slg-b_lob-walk_percent-run_percent, data = train, mtry = 7, importance = TRUE)
+
+#forest with only engineered features
+rf_engSwng <- randomForest(wRAA~., data = trainEng, mtry = 3, importance = TRUE)
+
+# forest with swing metrics and engineered features
+rf_all <- randomForest(wRAA~.-on_base_plus_slg-b_lob-walk_percent-run_percent, data = retrain, mtry = 8, importance = TRUE)
+
+
+```
+
+
+
+```{r}
+#Cross Validation Testing
+
+kfold_cv <- function(formula, data, k = 5) {
+  n <- nrow(data)
+  folds <- sample(rep(1:k, length.out = n))
+  mse_values <- numeric(k)
+
+  for (i in 1:k) {
+    train_data <- data[folds != i, ]
+    test_data  <- data[folds == i, ]
+
+    fit <- lm(formula, data = train_data)
+    preds <- predict(fit, newdata = test_data)
+
+    mse_values[i] <- mean((test_data$wRAA - preds)^2)
+  }
+
+  mean(mse_values)
+}
+
+models <- list()
+
+cv_results <- sapply(models, kfold_cv, data = mlb_swings, k = 5)
+cv_results
+```
+

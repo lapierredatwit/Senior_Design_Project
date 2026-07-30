@@ -1,0 +1,454 @@
+---
+title: "Senior Project V3"
+author: "Devon Lapierre"
+date: "2026-07-06"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#Loading Dataset
+setwd("C:/Users/devon/OneDrive/Senior Project")
+
+mlb <- read.csv("stats.csv", header = TRUE, sep = ",")
+
+#Basic Cleaning
+
+mlb <- na.omit(mlb)
+mlb <- mlb[!duplicated(mlb), ]
+
+# Creating formula for wRAA to measure player performance
+
+# scale vector (first index 2015, last index 2025) from FanGraphs: https://www.fangraphs.com/tools/guts?type=cn
+wOBA_scale <- c(1.251, 1.212, 1.185, 1.226, 1.157, 1.185, 1.209, 1.259, 1.204, 1.242, 1.232)
+
+# league average wOBA by season (first index 2015, last index 2025) from FanGraphs: https://www.fangraphs.com/leaders/major-league?pos=all&stats=bat&lg=all&qual=0&type=8&month=0&ind=0&team=0%2Css&rost=0&players=0&sort=0%2Cd&startdate=&enddate=&season1=2015&season=2025
+lgwOBA <- c(.313, .318, .321, .315, .320, .320, .314, .310, .318, .310, .313)
+
+# Using the FanGraphs formula Weighted Runs Above Average (wRAA) = ((wOBA - lgwOBA) / wOBA_scale) * PA to have a metric strictly for offensive performance
+
+mlb$wRAA <- 0
+
+
+#apply formula to all observations
+for (i in 1:nrow(mlb)){
+  mlb$wRAA[i]<- ((mlb$woba[i] - lgwOBA[mlb$year[i] - 2014]) / wOBA_scale[mlb$year[i] - 2014]) * mlb$pa[i]
+}
+
+#Subset Selection
+
+swing_cols <- c(49, 50, 51, 52, 53, 56, 58, 59, 64, 67, 69, 71, 72, 73, 74, 75, 77, 78, 80, 82, 84)
+
+for (i in swing_cols){
+  mlb[ , i] <- mlb[ , i] / 100
+}
+
+swing_cols <- c(13, 17, 20, 28, 86, 49, 50, 51, 52, 53, 56, 58, 59, 64, 67, 69, 71, 72, 73, 74, 75, 77, 78, 80, 82, 84)
+
+#subset of features only including swing decision features and potential response variables
+mlb_swings <- mlb[, swing_cols]
+
+mlb_swings$walk_percent <- mlb$walk / mlb$pa
+mlb_swings$run_percent <- mlb$r_run / mlb$pa
+mlb_swings <- mlb_swings[ , c(-1, -4)]
+
+
+# Principal Component Analysis 
+swings_scaled <- scale(mlb_swings)
+pca <- prcomp(swings_scaled)
+summary(pca)
+plot(pca)
+
+
+# Standardize helper
+z <- function(x) (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+
+# 1. Contact Skill (PC1-like)
+mlb_swings$ContactSkill <- (
+    z(mlb_swings$iz_contact_percent) +
+    z(mlb_swings$oz_contact_percent) -
+    z(mlb_swings$whiff_percent) -
+    z(mlb_swings$z_swing_miss_percent) -
+    z(mlb_swings$oz_swing_miss_percent)
+) / 5
+
+# 2. Discipline Index (PC2-like)
+mlb_swings$DisciplineIndex <- (
+    -z(mlb_swings$oz_swing_percent) -
+    -z(mlb_swings$z_swing_percent) -
+    z(mlb_swings$out_zone_percent) +
+    z(mlb_swings$walk_percent)
+) / 4
+
+# 3. Elevation / Batted-Ball Shape (PC3-like)
+mlb_swings$ElevationIndex <- (
+    z(mlb_swings$popups_percent) +
+    z(mlb_swings$walk_percent) -
+    z(mlb_swings$pull_percent)
+) / 3
+
+# 4. Zone Coverage (PC4-like)
+mlb_swings$ZoneCoverage <- (
+    z(mlb_swings$in_zone_percent) +
+    z(mlb_swings$out_zone_percent) -
+    z(mlb_swings$meatball_percent)
+) / 3
+
+# 5. Spray Power (PC5-like)
+mlb_swings$SprayPower <- (
+    z(mlb_swings$opposite_percent) -
+    z(mlb_swings$pull_percent) +
+    z(mlb_swings$on_base_plus_slg)
+) / 3
+
+
+#Creating the 80/20 train/test split
+set.seed(1)
+n <- nrow(mlb_swings)
+train_idx <- sample(seq_len(n), size = 0.8 * n)
+
+train <- mlb_swings[train_idx, ]
+test  <- mlb_swings[-train_idx, ]
+
+# further sub-dataset with engineered features and response, more features could be added
+
+sw_feats <- c(3, 27, 28, 29, 30, 31)
+
+sw_dat <- mlb_swings[, sw_feats]
+
+trainEng <- sw_dat[train_idx, ]
+testEng  <- sw_dat[-train_idx, ]
+
+#Regression models
+
+spray_mod <- wRAA~SprayPower
+sprayZone_mod <- wRAA~SprayPower+ZoneCoverage
+sprayZoneDisc_mod <- wRAA~SprayPower+ZoneCoverage+DisciplineIndex
+sprayZoneDiscElev_mod <- wRAA~SprayPower+ZoneCoverage+DisciplineIndex+ElevationIndex
+engSwing_mod <- wRAA~SprayPower+ZoneCoverage+DisciplineIndex+ElevationIndex+ContactSkill
+
+
+#Random Forests
+
+library(tree)
+set.seed(1)
+
+# 1 singular decision tree with the engineered features
+
+engSwng_tree <- tree(wRAA~., data = trainEng)
+
+cv_overgrown <- cv.tree(engSwng_tree, FUN = prune.tree)
+pruned_Swng <- prune.tree(engSwng_tree, best = 4)
+
+
+library(randomForest)
+#Will grow two random forests - one with all of the swing decision metrics as predictors, and one with just the engineered features. Potentially a third with a combination of both depending on how the first two perform.
+
+
+# forest with only swing metrics
+rf_allSwng <- randomForest(wRAA~.-on_base_plus_slg-b_lob-walk_percent-run_percent-SprayPower-ZoneCoverage-DisciplineIndex-ElevationIndex-
+                             ContactSkill, data = train, mtry = 7, importance = TRUE)
+
+#forest with only engineered features
+rf_engSwng <- randomForest(wRAA~., data = trainEng, mtry = 3, importance = TRUE)
+
+# forest with swing metrics and engineered features
+rf_all <- randomForest(wRAA~.-on_base_plus_slg-b_lob-walk_percent-run_percent, data = train, mtry = 8, importance = TRUE)
+
+
+# Ridge regression
+library(MASS)
+
+X <- model.matrix(wRAA ~ SprayPower + ZoneCoverage + DisciplineIndex +
+                    ElevationIndex + ContactSkill, data = trainEng)[, -1]
+
+y <- trainEng$wRAA
+
+ridge_mod <- lm.ridge(y ~ X, lambda = seq(0, 50, 0.5))
+best_lambda <- ridge_mod$lambda[which.min(ridge_mod$GCV)]
+
+ridge_final <- lm.ridge(y ~ X, lambda = best_lambda)
+
+
+ridge_predict <- function(ridge_model, newdata, formula) {
+  # Build model matrix from new data
+  X_new <- model.matrix(formula, newdata)[, -1]
+  
+  # Standardize using training means and scales stored in ridge_model
+  X_scaled <- scale(X_new,
+                    center = ridge_model$xm,
+                    scale  = ridge_model$scale)
+  
+  # Compute predictions: X_scaled %*% coef + intercept
+  preds <- X_scaled %*% ridge_model$coef + ridge_model$ym
+  
+  as.numeric(preds)
+}
+
+ridge_preds <- ridge_predict(
+  ridge_model = ridge_final,
+  newdata = testEng,
+  formula = wRAA ~ SprayPower + ZoneCoverage + DisciplineIndex +
+              ElevationIndex + ContactSkill
+)
+
+```
+
+
+
+```{r}
+library(Metrics)
+
+evaluate_model <- function(model, train, test, response = "wRAA") {
+  # predictions
+  train_pred <- predict(model, newdata = train)
+  test_pred  <- predict(model, newdata = test)
+  
+  # actuals
+  y_train <- train[[response]]
+  y_test  <- test[[response]]
+  
+  # metrics
+  out <- data.frame(
+    RMSE_train = rmse(y_train, train_pred),
+    RMSE_test  = rmse(y_test, test_pred),
+    MAE_train  = mae(y_train, train_pred),
+    MAE_test   = mae(y_test, test_pred),
+    R2_train   = 1 - sum((y_train - train_pred)^2) / sum((y_train - mean(y_train))^2),
+    R2_test    = 1 - sum((y_test - test_pred)^2) / sum((y_test - mean(y_test))^2)
+  )
+  return(out)
+}
+
+
+eval_spray      <- evaluate_model(lm(spray_mod, trainEng), trainEng, testEng)
+eval_sprayZone  <- evaluate_model(lm(sprayZone_mod, trainEng), trainEng, testEng)
+eval_sprayDisc  <- evaluate_model(lm(sprayZoneDisc_mod, trainEng), trainEng, testEng)
+eval_sprayAll   <- evaluate_model(lm(engSwing_mod, trainEng), trainEng, testEng)
+#eval_ridge <- evaluate_model(ridge_final, trainEng, testEng)
+
+eval_tree <- evaluate_model(pruned_Swng, trainEng, testEng)
+
+eval_rf_allSwng <- evaluate_model(rf_allSwng, train, test)
+eval_rf_engSwng <- evaluate_model(rf_engSwng, trainEng, testEng)
+eval_rf_all     <- evaluate_model(rf_all, train, test)
+
+```
+
+
+```{r}
+# Neural Network
+library(RSNNS)
+library(Metrics)
+
+responses <- c(-1, -2, -3, -25, -26)
+
+# Preprocess manually
+train_x <- scale(train[, responses])
+test_x  <- scale(
+  test[, responses],
+  center = attr(train_x, "scaled:center"),
+  scale = attr(train_x, "scaled:scale")
+)
+
+train_y <- train$wRAA
+test_y  <- test$wRAA
+
+# Train MLP
+
+nn <- mlp(
+  x = as.matrix(train_x),
+  y = train_y,
+  size = c(32, 16),
+  learnFunc = "Std_Backpropagation",
+  learnFuncParams = c(0.005, 0.9),  # lower LR
+  updateFunc = "Topological_Order",
+  maxit = 800,
+  linOut = TRUE,
+  decay = 0.001   # regularization
+)
+
+
+
+# Predict
+nn_pred <- predict(nn, as.matrix(test_x))
+
+# Metrics
+nn_rmse <- rmse(test_y, nn_pred)
+nn_mae  <- mae(test_y, nn_pred)
+
+nn_rmse
+nn_mae
+
+
+ridge_rmse <- rmse(testEng$wRAA, ridge_preds)
+ridge_mae <- mae(testEng$wRAA, ridge_preds)
+```
+
+```{r}
+
+results <- rbind(
+  Spray = eval_spray,
+  SprayZone = eval_sprayZone,
+  SprayDisc = eval_sprayDisc,
+  Ridge = data.frame(
+    RMSE_train = NA,
+    RMSE_test = ridge_rmse,
+    MAE_train = NA,
+    MAE_test = ridge_mae,
+    R2_train = NA,
+    R2_test = NA),
+  EngSwing = eval_sprayAll,
+  Tree = eval_tree,
+  RF_AllSwng = eval_rf_allSwng,
+  RF_EngSwng = eval_rf_engSwng,
+  RF_All = eval_rf_all,
+  NN = data.frame(
+    RMSE_train = NA,
+    RMSE_test = nn_rmse,
+    MAE_train = NA,
+    MAE_test = nn_mae,
+    R2_train = NA,
+    R2_test = NA
+  ),
+  .id = "Model"
+)
+
+
+print(results)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+# Variable Importance
+
+#Regression is self explanatory as forward stepwise was used
+
+#Decision tree is self explanatory as we can visualize the tree
+
+#Random Forests
+importance(rf_allSwng)
+```
+
+```{r}
+importance(rf_engSwng)
+```
+
+```{r}
+importance(rf_all)
+```
+
+```{r}
+# Neural Net
+
+variable_importance_sensitivity <- function(model, X, delta = 1e-4) {
+  X <- as.matrix(X)
+  base_pred <- predict(model, X)
+
+  p <- ncol(X)
+  importance <- numeric(p)
+
+  for (j in 1:p) {
+    X_perturbed <- X
+    X_perturbed[, j] <- X_perturbed[, j] + delta
+
+    pred_perturbed <- predict(model, X_perturbed)
+
+    # Sensitivity = average absolute change in prediction
+    importance[j] <- mean(abs(pred_perturbed - base_pred))
+  }
+
+  importance <- importance / sum(importance)
+
+  data.frame(
+    Variable = colnames(X),
+    Importance = importance
+  )[order(importance, decreasing = TRUE), ]
+}
+
+
+
+variable_importance_sensitivity(nn, train[, responses])
+```
+
+
+```{r}
+#Predicted vs Actual Plots
+
+plot_predicted_vs_actual <- function(pred, actual, model_name="Model") {
+  plot(actual, pred,
+     xlab = "Actual Values",
+     ylab = "Predicted Values",
+     main = model_name,
+     pch = 19, col = "steelblue")
+
+  abline(0, 1, col = "red", lwd = 2)   # perfect prediction line
+
+}
+
+
+#Residual Plots
+
+
+plot_residuals <- function(pred, actual, model_name="Model") {
+  res <- actual - pred
+  
+  par(mfrow=c(1,2))
+  
+  plot(pred, res,
+       main=paste(model_name, "- Residuals vs Fitted"),
+       xlab="Fitted Values", ylab="Residuals")
+  abline(h=0, col="red")
+  
+  qqnorm(res, main=paste(model_name, "- Residual Q-Q"))
+  qqline(res, col="red")
+  
+  par(mfrow=c(1,1))
+}
+
+
+lm_preds <- predict.lm(lm(engSwing_mod, trainEng), newdata = testEng)
+rf_allSwng_preds <- predict(rf_allSwng, newdata = test)
+rf_engSwng_preds<- predict(rf_engSwng, newdata = testEng)
+rf_all_preds <- predict(rf_all, newdata = test)
+nn_preds <- predict(nn, newdata = test[, responses])
+
+```
+
+```{r}
+
+#Residuals
+plot_residuals(nn_preds, test$wRAA, "Neural Network")
+plot_residuals(rf_all_preds, test$wRAA, "Full RF")
+plot_residuals(rf_engSwng_preds, testEng$wRAA, "Eng RF")
+plot_residuals(rf_allSwng_preds, test$wRAA, "Swng RF")
+plot_residuals(lm_preds, testEng$wRAA, "Eng Regression")
+plot_residuals(ridge_preds, testEng$wRAA, "Ridge")
+```
+
+```{r}
+#Actual vs Predicted
+plot_predicted_vs_actual(nn_preds, test$wRAA, "Neural Network")
+plot_predicted_vs_actual(rf_all_preds, test$wRAA, "Full RF")
+plot_predicted_vs_actual(rf_engSwng_preds, testEng$wRAA, "Eng RF")
+plot_predicted_vs_actual(rf_allSwng_preds, test$wRAA, "Swng RF")
+plot_predicted_vs_actual(lm_preds, testEng$wRAA, "Eng Regression")
+plot_predicted_vs_actual(ridge_preds, testEng$wRAA, "Ridge")
+```
+
+
+
